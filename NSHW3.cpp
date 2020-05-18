@@ -33,7 +33,7 @@ using namespace std;
 
 #define SimplePage( x ) \
 		"<form action=\"/\" method=\"POST\">>"\
-			"<input type=\"text\" placeholder=\"Command\" name=\"cmd\">"\
+			"<input type=\"text\" placeholder=\"Command\" name=\"cmd\" autofocus>"\
 			"<input type=\"submit\" value=\"Submit\">"\
 		"</form>" \
 		"<div>" + (string)( x ) + "</div>"
@@ -42,13 +42,13 @@ void test_tls_handler(int client_socket);
 void http_handler(int);
 void file_handler(int, HttpHeaderParser&);
 void cgi_handler(int, HttpHeaderParser&);
-int socket_driver(SSL *ssl, int client, int child_pid, int (&S2B)[2], int (&B2S)[2]);
+int socket_driver(SSL *ssl, int client, int (&S2B)[2], int (&B2S)[2]);
 void bash_driver(int (&S2B)[2], int (&B2S)[2]);
 void html_404_handler(int, const char*);
 void http_sender(int dest_socket, std::map<string, string> header_options);
 void https_sender(SSL *ssl, std::map<string, string> header_options);
 string create_https_response(std::map<string, string> header_options);
-int client_handler(int client, SSL_CTX *ctx);
+int client_handler(int client, SSL_CTX *ctx, int (&S2B)[2], int (&B2S)[2]);
 
 string get_http_time() {
 	char buf[30];
@@ -104,6 +104,27 @@ int main(int argc, char const *argv[]) {
 	//Setup socket server
 	listen = create_listen(TLS_SERVER_IP, TLS_SERVER_PORT);
 
+	//Setup bash environment
+	int S2B[2], B2S[2];
+	//Create pipe for bash
+	if (pipe(S2B) < 0 || pipe(B2S) < 0) {
+		PERROR("Cannot Create Pipeline For Bash");
+		exit(EXIT_FAILURE);
+	}
+
+	//Create Bash
+	switch (forkm()) {
+	case -1:
+		PERROR("Cannot Create Child Process")
+		exit(EXIT_FAILURE);
+		break;
+	case 0:
+		close(listen);
+		bash_driver(S2B, B2S);
+		exit(0);
+		break;
+	}
+
 	//Handle connections
 	while (1) {
 		int client = accept(listen, (struct sockaddr*) &in_addr, &in_len);
@@ -113,7 +134,7 @@ int main(int argc, char const *argv[]) {
 		} else {
 			PINFO("New Client! (fd:" << client << ")")
 
-			//do fork
+			//Create Client Handler
 			switch (forkm()) {
 			case -1:
 				PERROR("Failed to Fork")
@@ -123,7 +144,7 @@ int main(int argc, char const *argv[]) {
 				//client ignore server socket
 				close(listen);
 				//Service
-				exit(client_handler(client, ctx));
+				exit(client_handler(client, ctx, S2B, B2S));
 				break;
 			default:
 				//server ignore client socket
@@ -139,7 +160,7 @@ int main(int argc, char const *argv[]) {
 	return 0;
 }
 
-int client_handler(int client, SSL_CTX *ctx) {
+int client_handler(int client, SSL_CTX *ctx, int (&S2B)[2], int (&B2S)[2]) {
 	int ret = 0;
 
 	SSL *ssl = SSL_new(ctx);
@@ -152,33 +173,7 @@ int client_handler(int client, SSL_CTX *ctx) {
 		ret = -1;
 	} else {
 		PINFO("SSL Accepted.");
-//		SSL_write(ssl, "BEGIN SSL", 9);
-//		https_sender(ssl, { { "Content", "Testing HTTPS Connection", } });
-
-		int S2B[2], B2S[2];
-		//Create pipe for bash
-		if (pipe(S2B) < 0 || pipe(B2S) < 0) {
-			PERROR("Cannot Create Pipeline For Bash");
-			exit(EXIT_FAILURE);
-		}
-
-		int child_pid;
-		switch (child_pid = forkm()) {
-		case -1:
-			PERROR("Cannot Create Child Process")
-			exit(EXIT_FAILURE);
-			break;
-		case 0:
-			close(client);
-
-			bash_driver(S2B, B2S);
-			exit(0);
-			break;
-		default:
-			socket_driver(ssl, client, child_pid, S2B, B2S);
-			break;
-		}
-
+		socket_driver(ssl, client, S2B, B2S);
 		close_ssl(ssl);
 		close(client);
 		PINFO("Connection Closed. (fd:" << client << ")")
@@ -205,7 +200,7 @@ void bash_driver(int (&S2B)[2], int (&B2S)[2]) {
 	exit(0);
 }
 
-int socket_driver(SSL *ssl, int client, int child_pid, int (&S2B)[2], int (&B2S)[2]) {
+int socket_driver(SSL *ssl, int client, int (&S2B)[2], int (&B2S)[2]) {
 	//close bash send and  bash receive fd;
 	close(S2B[0]);
 	close(B2S[1]);
@@ -291,7 +286,7 @@ int socket_driver(SSL *ssl, int client, int child_pid, int (&S2B)[2], int (&B2S)
 					wait_bash_round = 0;
 				} else if (wait_bash_round > 10) {
 					wait_bash_round = 0;
-					str_s2c = create_https_response( { { "Status", "200 OK" }, { "Content", SimplePage(html_lineup(str_s2c.length()==0?"Timeout!!":str_s2c)) } });
+					str_s2c = create_https_response( { { "Status", "200 OK" }, { "Content", SimplePage(html_lineup(str_s2c.length() == 0 ? "No Response..." : str_s2c)) } });
 					progress = 3;
 				} else {
 					usleep(100000);
@@ -334,118 +329,8 @@ int socket_driver(SSL *ssl, int client, int child_pid, int (&S2B)[2], int (&B2S)
 			}
 		}
 	}
-	EPOLL_END:
-	PINFO("Closing PINFO");
-	write(S2B[1], "exit\n", 4);
-	close(epollfd);
+	EPOLL_END: close(epollfd);
 	return 0;
-}
-
-//void http_handler(int client_socket) {
-//	char buffer[BUF_LEN] = { 0 };
-//	int read_count = 0;
-//	//select() requirements.
-//	fd_set rset;
-//	//	{secs, usecs}
-//	timeval tv = { KEEP_ALIVE_TIMEOUT, 0 };
-//
-//	//setup
-//	FD_ZERO(&rset);
-//
-//	while (1) {
-//		try {
-//			//watch client_socket
-//			FD_SET(client_socket, &rset);
-//
-//			int readyN = select(client_socket + 1, &rset, NULL, NULL, &tv);
-//			//if timeout or error
-//			if (readyN <= 0)
-//				throw EC_CON_TIMEOUT;
-//			//if client_socket has event
-//			else if (FD_ISSET(client_socket, &rset)) {
-//				read_count = recv(client_socket, buffer, BUF_LEN, MSG_DONTWAIT);
-//				//nothing to read
-//				if (read_count == -1)
-//					continue;
-//				//connection closed
-//				else if (read_count == 0)
-//					break;
-//
-//				PINFO("Http Request:\n"<< buffer <<endl)
-//				HttpHeaderParser parser(client_socket, buffer);
-//				if (parser.getFile().find("cgi") != string::npos)
-//					cgi_handler(client_socket, parser);
-//				else
-//					file_handler(client_socket, parser);
-//			}
-//		} catch (const char *msg) {
-//			PINFO("Send 404.")
-//			html_404_handler(client_socket, msg);
-//		} catch (int errorCode) {
-//			if (errorCode == EC_CON_TIMEOUT) {
-//				PINFO("Connection Overtime.")
-//				break;
-//			} else if (errorCode == EC_CON_CLOSE) {
-//				PINFO("Connection Closed By Client.")
-//				break;
-//			} else {
-//				http_sender(client_socket,
-//						{ { "Status", "500 Internal Server Error" }, { "Content", "Unknown Error" } });
-//			}
-//		} catch (...) {
-//			PINFO("Send 500.")
-//			http_sender(client_socket, { { "Status", "500 Internal Server Error" }, { "Content", "Server Error" } });
-//			break;
-//		}
-//		memset(buffer, '\0', BUF_LEN);
-//	}
-//
-//	close(client_socket);
-//	PINFO("<!Socket Closed!>")
-//}
-
-void http_sender(int dest_socket, std::map<string, string> header_options) {
-	string ret = "HTTP/1.1 " + (header_options.count("Status") ? header_options["Status"] : "404 Not Found") + "\r\n"
-	CONNECTION_OPTION
-	"Date: " + get_http_time() + "\r\n"
-			"Expires: -1\r\n"
-			"Server: NSHW1_EZHTTPD\r\n"
-			"Cache-Control: private, max-age=0\r\n"
-			"Content-Type:" + (header_options.count("Content-Type") ? header_options["Content-Type"] : " text/html; charset=UTF-8") + "\r\n"
-			"Content-Length:" + (header_options.count("Content") ? to_string(header_options["Content"].size()) : "0") + " \r\n"
-	//Add Custom Header
-			+ header_options["Custom"] +
-			//Add Content
-			"\r\n" + header_options["Content"] + "\r\n";
-
-	//Send Packet
-	for (int i = 0, j = ret.size(); i < j; i += BUF_LEN) {
-		send(dest_socket, (void*) &ret[i], ((j - i) < BUF_LEN ? j - i : BUF_LEN), 0);
-	}
-
-	PINFO("Sent Package:\n" << ret)
-}
-
-void https_sender(SSL *ssl, std::map<string, string> header_options) {
-	string ret = "HTTP/1.1 " + (header_options.count("Status") ? header_options["Status"] : "404 Not Found") + "\r\n"
-	CONNECTION_OPTION
-	"Date: " + get_http_time() + "\r\n"
-			"Expires: -1\r\n"
-			"Server: NSHW1_EZHTTPD\r\n"
-			"Cache-Control: private, max-age=0\r\n"
-			"Content-Type:" + (header_options.count("Content-Type") ? header_options["Content-Type"] : " text/html; charset=UTF-8") + "\r\n"
-			"Content-Length:" + (header_options.count("Content") ? to_string(header_options["Content"].size()) : "0") + " \r\n"
-//Add Custom Header
-			+ header_options["Custom"] +
-//Add Content
-			"\r\n" + header_options["Content"] + "\r\n";
-
-	//Send Packet
-	for (int i = 0, j = ret.size(); i < j; i += BUF_LEN) {
-		SSL_write(ssl, (const void*) &ret[i], ((j - i) < BUF_LEN ? j - i : BUF_LEN));
-	}
-
-	PINFO("Sent Package:\n" << ret)
 }
 
 string create_https_response(std::map<string, string> header_options) {
@@ -461,110 +346,4 @@ string create_https_response(std::map<string, string> header_options) {
 			+ header_options["Custom"] + "\r\n"
 			//Add Content
 			+ header_options["Content"] + "\r\n");
-}
-
-void file_handler(int client_socket, HttpHeaderParser &parser) {
-	int file_size = 0;
-	string fullPath = ROOT_PATH + parser.getPath();
-	PINFO("FullPath:" << fullPath);
-	std::fstream infile = std::fstream(fullPath, ios::in | ios::binary);
-
-	if (!infile) {
-		PINFO("HTML Handler: Cannot Open FIle.")
-		throw "Cannot Open File.";
-	}
-
-	infile.seekg(0, infile.end);
-	file_size = infile.tellg();
-	infile.seekg(0, infile.beg);
-	char *buffer = new char[file_size + 1];
-	buffer[file_size] = '\0';
-	PINFO("File Size:" << file_size)
-	infile.read(buffer, file_size);
-	infile.close();
-
-	http_sender(client_socket, { { "Status", "200 OK" }, { "Content", buffer } });
-
-	delete[] buffer;
-}
-
-void cgi_handler(int client_socket, HttpHeaderParser &parser) {
-	PINFO("CGI Handling.");
-	string fullPath = ROOT_PATH + parser.getPath();
-	if (access(fullPath.c_str(), F_OK) == -1)
-		throw "No Cgi File";
-
-	int ParentOutput[2] = { 0 };
-	int ChildOutput[2] = { 0 };
-	int status;
-	pid_t cpid;
-	char c;
-
-	/* Use pipe to create a data channel betweeen two process
-	 'ParentOutput'  handle  data from 'host' to 'CGI'
-	 'ChildOutput' handle data from 'CGI' to 'host'*/
-	if (pipe(ParentOutput) < 0 || pipe(ChildOutput) < 0) {
-		throw "Cannot Execute Cgi. Cannot CreatePipe.";
-	}
-
-	/* Creates a new process to execute cgi program */
-	if ((cpid = fork()) < 0) {
-		throw "Cannot Execute Cgi. Fork Failed.";
-	}
-
-	/*child process*/
-	if (cpid == 0) {
-		//close unused fd
-		close(ParentOutput[1]);
-		close(ChildOutput[0]);
-
-		//redirect the output from stdout to cgiOutput
-		dup2(ChildOutput[1], STDOUT_FILENO);
-
-		//redirect the input from stdin to cgiInput
-		dup2(ParentOutput[0], STDIN_FILENO);
-
-		//after redirect we don't need the old fd
-		close(ParentOutput[0]);
-		close(ChildOutput[1]);
-
-		/* execute cgi program
-		 the stdout of CGI program is redirect to cgiOutput
-		 the stdin  of CGI program is redirect to cgiInput
-		 */
-
-		execlp(fullPath.c_str(), fullPath.c_str(), NULL);
-		exit(0);
-	}
-
-	/*parent process*/
-	else {
-		//close unused fd
-		close(ParentOutput[0]);
-		close(ChildOutput[1]);
-
-		// send the message to the CGI program
-		string params = parser.getParams();
-		int totalSize = params.size();
-		for (int i = 0; i < totalSize;) {
-			i += write(ParentOutput[1], &params[i], (i + BUF_LEN < totalSize ? BUF_LEN : totalSize - i));
-		}
-
-		// receive the message from the  CGI program
-		string result = "";
-		while (read(ChildOutput[0], &c, 1) > 0) {
-			//buffer the message
-			result.append(1, c);
-		}
-
-		// connection finish
-		close(ChildOutput[0]);
-		close(ParentOutput[1]);
-		waitpid(cpid, &status, 0);
-		http_sender(client_socket, { { "Status", "200 OK" }, { "Content", result } });
-	}
-}
-
-void html_404_handler(int client_socket, const char *msg) {
-	http_sender(client_socket, { { "Status", "404 Not Found" }, { "Content", msg } });
 }
